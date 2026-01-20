@@ -1,0 +1,15 @@
+{
+  "manifest_version": 2,
+  "name": "GameInputFix",
+  "version": "1.0",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "gamefix@fct.com"
+    }
+  },
+  "content_scripts": [{
+    "matches": ["http://127.0.0.1/*"],
+    "js": ["touchPatch.js"],
+    "run_at": "document_end"
+  }]
+}
