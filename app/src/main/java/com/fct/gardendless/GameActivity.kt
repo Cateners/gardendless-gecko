@@ -39,12 +39,24 @@ import java.io.File
 import java.util.zip.ZipInputStream
 import androidx.core.net.toUri
 
+object GeckoManager {
+    private var runtime: GeckoRuntime? = null
+
+    fun getRuntime(context: android.content.Context): GeckoRuntime {
+        if (runtime == null) {
+            // 确保使用 ApplicationContext，防止内存泄漏
+            runtime = GeckoRuntime.create(context.applicationContext)
+        }
+        return runtime!!
+    }
+}
+
 class GameActivity : AppCompatActivity() {
 
     // GeckoView 核心
     private lateinit var geckoView: GeckoView
     private val geckoSession = GeckoSession()
-    private val geckoRuntime by lazy { GeckoRuntime.create(this) }
+    private val geckoRuntime: GeckoRuntime get() = GeckoManager.getRuntime(this)
 
     // 状态维护
     private var canGoBackState: Boolean = false
@@ -110,6 +122,24 @@ class GameActivity : AppCompatActivity() {
 
         // 3. 配置 Session 代理
         geckoSession.apply {
+            // 配置 Session 权限代理
+            geckoSession.permissionDelegate = object : GeckoSession.PermissionDelegate {
+                override fun onContentPermissionRequest(
+                    session: GeckoSession,
+                    perm: GeckoSession.PermissionDelegate.ContentPermission
+                ): GeckoResult<Int>? {
+                    // 检查是否是自动播放权限请求（有声或无声）
+                    val isAutoplay = perm.permission == GeckoSession.PermissionDelegate.PERMISSION_AUTOPLAY_AUDIBLE ||
+                            perm.permission == GeckoSession.PermissionDelegate.PERMISSION_AUTOPLAY_INAUDIBLE
+
+                    if (isAutoplay) {
+                        // 强制返回“允许”状态
+                        return GeckoResult.fromValue(GeckoSession.PermissionDelegate.ContentPermission.VALUE_ALLOW)
+                    }
+                    // 其他权限（如地理位置、摄像头）按默认逻辑处理
+                    return null
+                }
+            }
             promptDelegate = object : GeckoSession.PromptDelegate {
                 override fun onFilePrompt(session: GeckoSession, prompt: GeckoSession.PromptDelegate.FilePrompt): GeckoResult<GeckoSession.PromptDelegate.PromptResponse>? {
                     // 保存 prompt 对象以便在 onActivityResult 中使用
@@ -265,7 +295,9 @@ class GameActivity : AppCompatActivity() {
 
     private fun setupFullScreen() {
         supportActionBar?.hide()
-        window.attributes.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            window.attributes.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             window.setDecorFitsSystemWindows(false)
             window.insetsController?.apply {
