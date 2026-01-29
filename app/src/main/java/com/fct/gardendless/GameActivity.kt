@@ -109,8 +109,10 @@ class GameActivity : AppCompatActivity() {
     private var fileCallback: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>? = null
 
     private fun initGeckoView() {
-        geckoView = GeckoView(this)
+        geckoView = MouseGameWebView(this)
         setContentView(geckoView)
+
+        // geckoRuntime.settings.setRemoteDebuggingEnabled(true)
 
         // 2. 加载 WebExtension (替代 evaluateJavascript)
         geckoRuntime.webExtensionController

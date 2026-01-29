@@ -65,17 +65,17 @@
         if (count > maxTouches) maxTouches = count;
 
         if (count === 1) {
-            emitMouseEvent("mousemove", e.touches[0], 0);
-            setTimeout(() => {
-                emitMouseEvent("mousedown", e.touches[0], 0);
-            }, delayTime)
-            isDragging = true;
+//            emitMouseEvent("mousemove", e.touches[0], 0);
+//            setTimeout(() => {
+//                emitMouseEvent("mousedown", e.touches[0], 0);
+//            }, delayTime)
+//            isDragging = true;
         } else if (count === 2) {
             touchStartCenter = getCenter(e.touches[0], e.touches[1]);
             lastWheelY = touchStartCenter.clientY;
             hasMovedEnough = false; // 重置移动判定
 
-            emitMouseEvent("mousemove", touchStartCenter, 0);
+            //emitMouseEvent("mousemove", touchStartCenter, 0);
             if (isDragging) {
                 isDragging = false;
             }
@@ -87,9 +87,9 @@
         e.stopImmediatePropagation();
 
         if (e.touches.length === 1 && isDragging) {
-            setTimeout(() => {
-                emitMouseEvent("mousemove", e.touches[0], 0);
-            }, delayTime)
+//            setTimeout(() => {
+//                emitMouseEvent("mousemove", e.touches[0], 0);
+//            }, delayTime)
         } else if (e.touches.length === 2) {
             const currentCenter = getCenter(e.touches[0], e.touches[1]);
             const deltaYTotal = Math.abs(currentCenter.clientY - touchStartCenter.clientY);
@@ -98,7 +98,7 @@
             if (hasMovedEnough || deltaYTotal > moveThreshold) {
                 hasMovedEnough = true;
                 const deltaY = lastWheelY - currentCenter.clientY;
-                emitWheelEvent(touchStartCenter, deltaY * 2);
+                //emitWheelEvent(touchStartCenter, deltaY * 2);
                 lastWheelY = currentCenter.clientY;
             }
         }
@@ -109,9 +109,9 @@
         e.stopImmediatePropagation();
 
         if (maxTouches === 1) {
-            setTimeout(() => {
-                emitMouseEvent("mouseup", e.changedTouches[0], 0);
-            }, delayTime);
+//            setTimeout(() => {
+//                emitMouseEvent("mouseup", e.changedTouches[0], 0);
+//            }, delayTime);
         }
         // 只有当没有触发过滚动（hasMovedEnough 为 false）时，才触发右键
         else if (maxTouches === 2 && e.touches.length === 0 && !hasMovedEnough) {
