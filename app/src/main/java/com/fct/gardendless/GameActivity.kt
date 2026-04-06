@@ -110,7 +110,47 @@ class GameActivity : AppCompatActivity() {
 
     private fun initGeckoView() {
         geckoView = MouseGameWebView(this)
-        setContentView(geckoView)
+
+        // 创建一个黑色背景的容器，重写测量逻辑强制子 View 保持 16:9
+        val container = object : android.widget.FrameLayout(this) {
+            override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+                super.onMeasure(widthMeasureSpec, heightMeasureSpec)
+                val screenWidth = measuredWidth
+                val screenHeight = measuredHeight
+
+                var targetWidth = screenWidth
+                var targetHeight = screenHeight
+
+                if (screenWidth * 9 > screenHeight * 16) {
+                    // 屏幕更宽 (例如 20:9)，以高度为基准计算宽度，左右留黑边
+                    targetWidth = screenHeight * 16 / 9
+                } else {
+                    // 屏幕更方 (例如 7:5)，以宽度为基准计算高度，上下留黑边
+                    targetHeight = screenWidth * 9 / 16
+                }
+
+                // 强制指定子 View (WebView) 的精确测量尺寸
+                getChildAt(0).measure(
+                    MeasureSpec.makeMeasureSpec(targetWidth, MeasureSpec.EXACTLY),
+                    MeasureSpec.makeMeasureSpec(targetHeight, MeasureSpec.EXACTLY)
+                )
+            }
+        }
+
+        // 设置背景为纯黑，充当黑边
+        container.setBackgroundColor(android.graphics.Color.BLACK)
+
+        // 设置 WebView 居中显示
+        val layoutParams = android.widget.FrameLayout.LayoutParams(
+            android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
+            android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply {
+            gravity = android.view.Gravity.CENTER
+        }
+        container.addView(geckoView, layoutParams)
+
+        // 将容器设置为 Content View
+        setContentView(container)
 
         // geckoRuntime.settings.setRemoteDebuggingEnabled(true)
 
