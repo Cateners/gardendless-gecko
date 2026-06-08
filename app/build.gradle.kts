@@ -22,8 +22,8 @@ android {
         applicationId = "com.fct.gardendless.gecko"
         minSdk = 27
         targetSdk = 36
-        versionCode = 6
-        versionName = "0.8.2"
+        versionCode = 7
+        versionName = "0.9.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
