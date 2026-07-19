@@ -38,6 +38,7 @@ import org.mozilla.geckoview.*
 import java.io.File
 import java.util.zip.ZipInputStream
 import androidx.core.net.toUri
+import androidx.core.view.isEmpty
 
 object GeckoManager {
     private var runtime: GeckoRuntime? = null
@@ -115,18 +116,28 @@ class GameActivity : AppCompatActivity() {
         val container = object : android.widget.FrameLayout(this) {
             override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
                 super.onMeasure(widthMeasureSpec, heightMeasureSpec)
+
+                if (isEmpty()) return
+
                 val screenWidth = measuredWidth
                 val screenHeight = measuredHeight
 
                 var targetWidth = screenWidth
                 var targetHeight = screenHeight
 
-                if (screenWidth * 9 > screenHeight * 16) {
-                    // 屏幕更宽 (例如 20:9)，以高度为基准计算宽度，左右留黑边
-                    targetWidth = screenHeight * 16 / 9
+                if (screenWidth * 90 > screenHeight * 171) {
+                    // 1. 屏幕【太宽】了：超过了 17:9 (例如 20:9, 21:9 手机)
+                    // 此时以高度为基准，宽度强行卡死在 17:9，左右留黑边
+                    targetWidth = screenHeight * 171 / 90
+                } else if (screenWidth * 100 < screenHeight * 160) {
+                    // 2. 屏幕【太方/太高】了：窄于 16:10 (例如 4:3 或 7:5 平板)
+                    // 此时以宽度为基准，高度强行卡死在 16:10，上下留黑边
+                    targetHeight = screenWidth * 100 / 160
                 } else {
-                    // 屏幕更方 (例如 7:5)，以宽度为基准计算高度，上下留黑边
-                    targetHeight = screenWidth * 9 / 16
+                    // 屏幕比例在 16:10 到 17:9 之间
+                    // 全屏铺满
+                    targetWidth = screenWidth
+                    targetHeight = screenHeight
                 }
 
                 // 强制指定子 View (WebView) 的精确测量尺寸
