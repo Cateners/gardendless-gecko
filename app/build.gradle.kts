@@ -3,7 +3,6 @@ import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
 }
 
 val keystoreProperties = Properties()
@@ -15,15 +14,15 @@ if (keystorePropertiesFile.exists()) {
 android {
     namespace = "com.fct.gardendless"
     compileSdk {
-        version = release(36)
+        version = release(37)
     }
 
     defaultConfig {
         applicationId = "com.fct.gardendless.gecko"
         minSdk = 27
         targetSdk = 36
-        versionCode = 11
-        versionName = "0.13.0"
+        versionCode = 12
+        versionName = "0.14.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -80,4 +79,12 @@ dependencies {
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
+}
+
+// AGP 9 内置 Kotlin 编译器（当前为 2.2.x），而传递依赖会把 kotlin-stdlib 抬升至
+// 编译期无法解析的更高 metadata 版本，显式对齐以避免版本冲突
+configurations.all {
+    resolutionStrategy {
+        force("org.jetbrains.kotlin:kotlin-stdlib:2.2.10")
+    }
 }

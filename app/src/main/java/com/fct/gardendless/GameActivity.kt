@@ -23,10 +23,11 @@ import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
+import android.webkit.MimeTypeMap
 import android.widget.ProgressBar
+import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.content.FileProvider
 import com.google.android.material.color.DynamicColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import io.ktor.server.engine.*
@@ -64,17 +65,33 @@ class GameActivity : AppCompatActivity() {
     private var server: ApplicationEngine? = null
     private var serverPort: Int = 0
 
+    /** 画面容器，负责比例适配与全屏切换 */
+    private lateinit var aspectContainer: AspectRatioFrameLayout
+
+    private val prefs by lazy { getSharedPreferences("app_data", MODE_PRIVATE) }
+
+    // 导出流程：解出的内容等待用户选定目标后写入，文件名优先由游戏给出
+    private var pendingExport: ByteArray? = null
+    private var pendingExportName: String? = null
+
+    private companion object {
+        const val PREF_FULLSCREEN = "webview_fullscreen"
+        const val EXTENSION_LOCATION = "resource://android/assets/messaging_extension/"
+        const val EXTENSION_ID = "gamefix@fct.com"
+        const val TAG = "GameActivity"
+        /** 与 bridgePatch.js 约定的回传标题前缀 */
+        const val GD_TITLE_PREFIX = "[GD] "
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         DynamicColors.applyToActivityIfAvailable(this)
         setupFullScreen()
 
-        val sp = getSharedPreferences("app_data", MODE_PRIVATE)
-        val savedVersion = sp.getInt("extracted_version", 0)
         val currentVersion = packageManager.getPackageInfo(packageName, 0).versionCode
 
-        if (savedVersion != currentVersion) {
-            checkAndExtractAssets(currentVersion, sp)
+        if (prefs.getInt("extracted_version", 0) != currentVersion) {
+            checkAndExtractAssets(currentVersion)
         } else {
             startServerAndLaunchGame()
         }
@@ -112,65 +129,32 @@ class GameActivity : AppCompatActivity() {
     private fun initGeckoView() {
         geckoView = MouseGameWebView(this)
 
-        // 创建一个黑色背景的容器，重写测量逻辑强制子 View 保持 16:9
-        val container = object : android.widget.FrameLayout(this) {
-            override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-                super.onMeasure(widthMeasureSpec, heightMeasureSpec)
-
-                if (isEmpty()) return
-
-                val screenWidth = measuredWidth
-                val screenHeight = measuredHeight
-
-                var targetWidth = screenWidth
-                var targetHeight = screenHeight
-
-                if (screenWidth * 90 > screenHeight * 171) {
-                    // 1. 屏幕【太宽】了：超过了 17:9 (例如 20:9, 21:9 手机)
-                    // 此时以高度为基准，宽度强行卡死在 17:9，左右留黑边
-                    targetWidth = screenHeight * 171 / 90
-                } else if (screenWidth * 100 < screenHeight * 160) {
-                    // 2. 屏幕【太方/太高】了：窄于 16:10 (例如 4:3 或 7:5 平板)
-                    // 此时以宽度为基准，高度强行卡死在 16:10，上下留黑边
-                    targetHeight = screenWidth * 100 / 160
-                } else {
-                    // 屏幕比例在 16:10 到 17:9 之间
-                    // 全屏铺满
-                    targetWidth = screenWidth
-                    targetHeight = screenHeight
-                }
-
-                // 强制指定子 View (WebView) 的精确测量尺寸
-                getChildAt(0).measure(
-                    MeasureSpec.makeMeasureSpec(targetWidth, MeasureSpec.EXACTLY),
-                    MeasureSpec.makeMeasureSpec(targetHeight, MeasureSpec.EXACTLY)
-                )
-            }
+        // 黑色背景容器，重写测量逻辑实现比例动态适配（最小16:10，最大17:9）
+        aspectContainer = AspectRatioFrameLayout(this).apply {
+            setBackgroundColor(android.graphics.Color.BLACK)
+            // 沿用上次退出时的全屏状态，避免先小后大的尺寸跳变
+            fullscreen = prefs.getBoolean(PREF_FULLSCREEN, false)
+            // 设置 GeckoView 居中显示
+            addView(
+                geckoView,
+                android.widget.FrameLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
+                    android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { gravity = android.view.Gravity.CENTER }
+            )
         }
-
-        // 设置背景为纯黑，充当黑边
-        container.setBackgroundColor(android.graphics.Color.BLACK)
-
-        // 设置 WebView 居中显示
-        val layoutParams = android.widget.FrameLayout.LayoutParams(
-            android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
-            android.view.ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply {
-            gravity = android.view.Gravity.CENTER
-        }
-        container.addView(geckoView, layoutParams)
 
         // 将容器设置为 Content View
-        setContentView(container)
+        setContentView(aspectContainer)
 
         // geckoRuntime.settings.setRemoteDebuggingEnabled(true)
 
-        // 2. 加载 WebExtension (替代 evaluateJavascript)
+        // 2. 加载 WebExtension（GeckoView 没有 evaluateJavascript，只能通过扩展注入脚本）
         geckoRuntime.webExtensionController
-            .ensureBuiltIn("resource://android/assets/messaging_extension/", "gamefix@fct.com")
+            .ensureBuiltIn(EXTENSION_LOCATION, EXTENSION_ID)
             .accept(
-                { Log.d("GeckoView", "Extension injected successfully") },
-                { e -> Log.e("GeckoView", "Extension failed", e) }
+                { Log.d(TAG, "Extension injected: id=${it?.id} version=${it?.metaData?.version}") },
+                { e -> Log.e(TAG, "Extension failed", e) }
             )
 
         // 3. 配置 Session 代理
@@ -262,7 +246,25 @@ class GameActivity : AppCompatActivity() {
             contentDelegate = object : GeckoSession.ContentDelegate {
                 override fun onExternalResponse(session: GeckoSession, response: WebResponse) {
                     if (response.uri.startsWith("data:")) {
-                        exportDataUri(response.uri)
+                        exportDataUri(response.uri, response.headers["content-type"])
+                    }
+                }
+
+                // 页面进入/退出全屏（bridgePatch.js 会把游戏的 Tauri 全屏请求
+                // 翻译成标准 Fullscreen API，从而触发此回调）
+                override fun onFullScreen(session: GeckoSession, fullScreen: Boolean) {
+                    setWebviewFullscreen(fullScreen)
+                }
+
+                // 回传通道：bridgePatch.js 把网页世界的意图写入标题。
+                // 之所以不用 runtime.sendNativeMessage：实测其 Promise 静默 reject，
+                // 不触发 MessageDelegate；而 onTitleChange 稳定可达。
+                override fun onTitleChange(session: GeckoSession, title: String?) {
+                    val payload = title?.removePrefix(GD_TITLE_PREFIX) ?: return
+                    if (payload == title) return // 并非我们的消息
+                    when (payload.substringBefore(' ')) {
+                        "fullscreen" -> setWebviewFullscreen(payload.substringAfter(' ').toBoolean())
+                        "exportName" -> pendingExportName = payload.substringAfter(' ')
                     }
                 }
             }
@@ -276,24 +278,71 @@ class GameActivity : AppCompatActivity() {
         setupBackNavigation()
     }
 
-    private fun exportDataUri(dataUri: String) {
-        try {
-            val parts = dataUri.split(",")
-            if (parts.size < 2) return
-            val content = Uri.decode(parts.subList(1, parts.size).joinToString(","))
-            val cacheFile = File(cacheDir, "pp.json")
-            cacheFile.writeText(content)
+    private fun exportDataUri(dataUri: String, contentType: String?) {
+        val parts = dataUri.split(",")
+        if (parts.size < 2) return
+        pendingExport = Uri.decode(parts.subList(1, parts.size).joinToString(",")).toByteArray()
 
-            val contentUri = FileProvider.getUriForFile(this, "${packageName}.fileprovider", cacheFile)
-            val intent = Intent(Intent.ACTION_SEND).apply {
-                type = "application/json"
-                putExtra(Intent.EXTRA_STREAM, contentUri)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }
-            startActivity(Intent.createChooser(intent, getString(R.string.export)))
-        } catch (e: Exception) {
-            Log.e("Export", "Failed to export data", e)
+        // 交给系统保存对话框，由用户决定位置和文件名
+        val fallbackType = contentType?.takeIf { it.isNotBlank() } ?: "application/octet-stream"
+        val name = pendingExportName ?: suggestFileName(fallbackType)
+        pendingExportName = null
+        // 文件名通常已自带扩展名（由游戏给出），mime 必须与之匹配，
+        // 否则 SAF 会按 mime 再追加一个后缀（例如 .json 变成 .json.txt）
+        val type = mimeFromExtension(name) ?: fallbackType
+
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            this.type = type
+            addCategory(Intent.CATEGORY_OPENABLE)
+            putExtra(Intent.EXTRA_TITLE, name)
         }
+        startActivityForResult(intent, EXPORT_SAVE_RESULT_CODE)
+    }
+
+    private fun saveExportTo(uri: Uri, bytes: ByteArray) {
+        CoroutineScope(Dispatchers.IO).launch {
+            val ok = runCatching {
+                contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+                    ?: throw java.io.IOException("openOutputStream returned null")
+            }.isSuccess
+            withContext(Dispatchers.Main) {
+                Toast.makeText(
+                    this@GameActivity,
+                    if (ok) R.string.export_done else R.string.export_failed,
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+    }
+
+    /** 兜底文件名：游戏未给出名字时按类型和时间生成 */
+    private fun suggestFileName(mimeType: String): String {
+        val time = java.time.LocalDateTime.now()
+            .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))
+        return "gardendless_$time.${mimeToExtension(mimeType)}"
+    }
+
+    private fun mimeToExtension(mimeType: String): String =
+        when (val type = mimeType.substringBefore(';').trim()) {
+            "application/json" -> "json"
+            "text/plain" -> "txt"
+            "application/octet-stream" -> "bin"
+            else -> type.substringAfter('/').takeIf { it.all(Char::isLetterOrDigit) } ?: "bin"
+        }
+
+    private fun mimeFromExtension(fileName: String): String? {
+        val ext = fileName.substringAfterLast('.', "")
+            .takeIf { it.isNotBlank() && it != fileName } ?: return null
+        return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext.lowercase())
+    }
+
+    /**
+     * 切换画面满屏 / 比例适配，并持久化该状态供下次启动沿用。
+     */
+    private fun setWebviewFullscreen(enabled: Boolean) {
+        if (!::aspectContainer.isInitialized) return
+        aspectContainer.fullscreen = enabled
+        prefs.edit().putBoolean(PREF_FULLSCREEN, enabled).apply()
     }
 
     private fun setupBackNavigation() {
@@ -309,7 +358,7 @@ class GameActivity : AppCompatActivity() {
         })
     }
 
-    private fun checkAndExtractAssets(currentVersion: Int, sp: android.content.SharedPreferences) {
+    private fun checkAndExtractAssets(currentVersion: Int) {
         val progressBar = ProgressBar(this).apply { isIndeterminate = true; setPadding(50, 50, 50, 50) }
         val dialog = MaterialAlertDialogBuilder(this)
             .setTitle(R.string.unzipping)
@@ -334,7 +383,7 @@ class GameActivity : AppCompatActivity() {
                         }
                     }
                 }
-                sp.edit().putInt("extracted_version", currentVersion).apply()
+                prefs.edit().putInt("extracted_version", currentVersion).apply()
                 withContext(Dispatchers.Main) {
                     dialog.dismiss()
                     startServerAndLaunchGame()
@@ -381,36 +430,49 @@ class GameActivity : AppCompatActivity() {
     }
     private var currentFilePrompt: GeckoSession.PromptDelegate.FilePrompt? = null
     private val FILE_CHOOSER_RESULT_CODE = 101
+    private val EXPORT_SAVE_RESULT_CODE = 102
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
 
-        if (requestCode == FILE_CHOOSER_RESULT_CODE && fileCallback != null) {
-            val originalUri = if (resultCode == RESULT_OK) data?.data else null
-            val prompt = currentFilePrompt ?: return
+        when (requestCode) {
+            EXPORT_SAVE_RESULT_CODE -> {
+                val bytes = pendingExport
+                pendingExport = null
+                // 用户取消保存时 data 为 null，直接丢弃暂存内容
+                val uri = data?.data
+                if (bytes != null && uri != null) saveExportTo(uri, bytes)
+            }
+            FILE_CHOOSER_RESULT_CODE -> handleFileChooserResult(resultCode, data)
+        }
+    }
 
-            if (originalUri != null) {
-                // 关键补丁：转换 content:// 到 file://
-                val fileUri = if ("file".equals(originalUri.scheme, ignoreCase = true)) {
-                    originalUri
-                } else {
-                    toFileUri(this, originalUri)
-                }
+    private fun handleFileChooserResult(resultCode: Int, data: Intent?) {
+        if (fileCallback == null) return
+        val prompt = currentFilePrompt ?: return
+        val originalUri = if (resultCode == RESULT_OK) data?.data else null
 
-                if (fileUri != null) {
-                    // 传回拷贝后的 File Uri
-                    fileCallback?.complete(prompt.confirm(this, fileUri))
-                } else {
-                    fileCallback?.complete(prompt.dismiss())
-                }
+        if (originalUri != null) {
+            // 关键补丁：转换 content:// 到 file://
+            val fileUri = if ("file".equals(originalUri.scheme, ignoreCase = true)) {
+                originalUri
+            } else {
+                toFileUri(this, originalUri)
+            }
+
+            if (fileUri != null) {
+                // 传回拷贝后的 File Uri
+                fileCallback?.complete(prompt.confirm(this, fileUri))
             } else {
                 fileCallback?.complete(prompt.dismiss())
             }
-
-            // 释放引用
-            fileCallback = null
-            currentFilePrompt = null
+        } else {
+            fileCallback?.complete(prompt.dismiss())
         }
+
+        // 释放引用
+        fileCallback = null
+        currentFilePrompt = null
     }
     // 辅助函数：将 Content Uri 转换为私有目录下的 File Uri
     private fun toFileUri(context: android.content.Context, uri: Uri): Uri? {
