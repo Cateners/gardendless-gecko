@@ -18,6 +18,9 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.DocumentsContract
+import android.system.Os
+import android.system.OsConstants
 import android.util.Log
 import android.view.View
 import android.view.WindowInsets
@@ -30,11 +33,17 @@ import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
 import com.google.android.material.color.DynamicColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import io.ktor.http.*
+import io.ktor.server.application.*
 import io.ktor.server.engine.*
 import io.ktor.server.http.content.*
 import io.ktor.server.netty.*
+import io.ktor.server.request.*
+import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import kotlinx.coroutines.*
+import org.json.JSONArray
+import org.json.JSONObject
 import org.mozilla.geckoview.*
 import java.io.File
 import java.util.zip.ZipInputStream
@@ -70,6 +79,13 @@ class GameActivity : AppCompatActivity() {
 
     private val prefs by lazy { getSharedPreferences("app_data", MODE_PRIVATE) }
 
+    /**
+     * gp-next 数据目录，对应 Tauri 的 AppData 根。
+     * 页面侧把 plugin:path|resolve_directory 的返回值（本移植中为页面 origin）拼上 `/gp-next`，
+     * 因此数据实际位于 filesDir/gp-next，与 GameDocumentsProvider 的 gpnext 根指向同一目录。
+     */
+    private val gpNextDir: File by lazy { File(filesDir, GP_NEXT_DIR_NAME).apply { mkdirs() } }
+
     // 导出流程：解出的内容等待用户选定目标后写入，文件名优先由游戏给出
     private var pendingExport: ByteArray? = null
     private var pendingExportName: String? = null
@@ -79,8 +95,18 @@ class GameActivity : AppCompatActivity() {
         const val EXTENSION_LOCATION = "resource://android/assets/messaging_extension/"
         const val EXTENSION_ID = "gamefix@fct.com"
         const val TAG = "GameActivity"
+        const val GP_NEXT_DIR_NAME = "gp-next"
+
         /** 与 bridgePatch.js 约定的回传标题前缀 */
         const val GD_TITLE_PREFIX = "[GD] "
+
+        /**
+         * 本地服务器端口。
+         *
+         * 该端口属于对外接口的一部分，不可随意变更：localStorage 按 origin 隔离，
+         * 更换端口会切换 origin，导致 gp-next 设置与游戏存档全部读不到。
+         */
+        const val SERVER_PORT = 23337
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -97,25 +123,58 @@ class GameActivity : AppCompatActivity() {
         }
     }
 
+    /** 启动本地静态服务器，随后回主线程初始化 GeckoView */
     private fun startServerAndLaunchGame() {
         val gameDir = File(filesDir, "pvzge_web-master/docs")
 
         CoroutineScope(Dispatchers.IO).launch {
-// 1. 创建并启动服务器
-            val serverInstance = embeddedServer(Netty, port = 23337) {
+            val serverInstance = embeddedServer(Netty, port = SERVER_PORT) {
                 routing {
+                    // 游戏资源。default 把未命中的路径回落到 index.html。
                     staticFiles("/", gameDir) {
                         default("index.html")
+                    }
+
+                    // gp-next 数据目录。页面侧通过 fetch 该虚拟路径读取原始字节。
+                    //
+                    // 此处不可配置 default(...)：Ktor 在文件不存在时不作响应，而是继续走 defaultPath，
+                    // 配置后会返回 index.html 而非 404，游戏会把 HTML 当作 JSON 解析。
+                    staticFiles("/gp-next", gpNextDir)
+
+                    // 元数据与写操作。GeckoView 没有可用的 JS 桥，页面侧只能经 HTTP 调用；
+                    // 路径统一放在 path 查询参数中，写操作的请求体留给文件内容。
+                    route("/__gdnext/fs") {
+                        post("/readdir") {
+                            call.respondText(
+                                gpNextReadDirJson(call.gpNextQueryPath()),
+                                ContentType.Application.Json
+                            )
+                        }
+                        post("/stat") {
+                            val json = gpNextStatJson(call.gpNextQueryPath())
+                            if (json == null) call.respond(HttpStatusCode.NotFound)
+                            else call.respondText(json, ContentType.Application.Json)
+                        }
+                        post("/exists") { call.respondBool(gpNextExists(call.gpNextQueryPath())) }
+                        post("/mkdir") { call.respondBool(gpNextMkdir(call.gpNextQueryPath())) }
+                        post("/remove") { call.respondBool(gpNextRemove(call.gpNextQueryPath())) }
+                        post("/rename") {
+                            val params = call.request.queryParameters
+                            call.respondBool(
+                                gpNextRename(params["from"].orEmpty(), params["to"].orEmpty())
+                            )
+                        }
+                        post("/write") {
+                            val bytes = call.receiveStream().use { it.readBytes() }
+                            call.respondBool(gpNextWriteBytes(call.gpNextQueryPath(), bytes))
+                        }
                     }
                 }
             }.start(wait = false)
 
-            // 2. 关键修复：赋值给 server 变量时，访问 .engine 属性
-            // serverInstance.engine 的类型正是 ApplicationEngine
+            // 保存引擎实例供退出时停止。resolvedConnectors 为挂起函数，必须在协程中调用。
             server = serverInstance.engine
-
-            // 3. 获取端口
-            serverPort = serverInstance.engine.resolvedConnectors().firstOrNull()?.port ?: 23337
+            serverPort = serverInstance.engine.resolvedConnectors().firstOrNull()?.port ?: SERVER_PORT
 
             withContext(Dispatchers.Main) {
                 initGeckoView()
@@ -123,18 +182,18 @@ class GameActivity : AppCompatActivity() {
         }
     }
 
-    // 定义一个全局变量来持有结果处理器
+    /** 文件选择的结果，待 onActivityResult 完成后回填 */
     private var fileCallback: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>? = null
 
+    /** 装配 GeckoView、WebExtension 与 Session 回调，并加载游戏入口页 */
     private fun initGeckoView() {
         geckoView = MouseGameWebView(this)
 
-        // 黑色背景容器，重写测量逻辑实现比例动态适配（最小16:10，最大17:9）
+        // 黑底容器，负责 16:10 ~ 17:9 的比例适配与全屏切换
         aspectContainer = AspectRatioFrameLayout(this).apply {
             setBackgroundColor(android.graphics.Color.BLACK)
             // 沿用上次退出时的全屏状态，避免先小后大的尺寸跳变
             fullscreen = prefs.getBoolean(PREF_FULLSCREEN, false)
-            // 设置 GeckoView 居中显示
             addView(
                 geckoView,
                 android.widget.FrameLayout.LayoutParams(
@@ -144,12 +203,12 @@ class GameActivity : AppCompatActivity() {
             )
         }
 
-        // 将容器设置为 Content View
         setContentView(aspectContainer)
 
+        // 需要远程调试时取消下一行注释
         // geckoRuntime.settings.setRemoteDebuggingEnabled(true)
 
-        // 2. 加载 WebExtension（GeckoView 没有 evaluateJavascript，只能通过扩展注入脚本）
+        // 注入 WebExtension：GeckoView 没有 evaluateJavascript，页面钩子只能由扩展注入
         geckoRuntime.webExtensionController
             .ensureBuiltIn(EXTENSION_LOCATION, EXTENSION_ID)
             .accept(
@@ -157,23 +216,21 @@ class GameActivity : AppCompatActivity() {
                 { e -> Log.e(TAG, "Extension failed", e) }
             )
 
-        // 3. 配置 Session 代理
+        // 配置 Session 的各代理与回调
         geckoSession.apply {
-            // 配置 Session 权限代理
             geckoSession.permissionDelegate = object : GeckoSession.PermissionDelegate {
                 override fun onContentPermissionRequest(
                     session: GeckoSession,
                     perm: GeckoSession.PermissionDelegate.ContentPermission
                 ): GeckoResult<Int>? {
-                    // 检查是否是自动播放权限请求（有声或无声）
+                    // 自动播放权限（有声或无声）直接放行
                     val isAutoplay = perm.permission == GeckoSession.PermissionDelegate.PERMISSION_AUTOPLAY_AUDIBLE ||
                             perm.permission == GeckoSession.PermissionDelegate.PERMISSION_AUTOPLAY_INAUDIBLE
 
                     if (isAutoplay) {
-                        // 强制返回“允许”状态
                         return GeckoResult.fromValue(GeckoSession.PermissionDelegate.ContentPermission.VALUE_ALLOW)
                     }
-                    // 其他权限（如地理位置、摄像头）按默认逻辑处理
+                    // 其余权限（如地理位置、摄像头）按默认逻辑处理
                     return null
                 }
             }
@@ -186,11 +243,13 @@ class GameActivity : AppCompatActivity() {
 
                     val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
                         addCategory(Intent.CATEGORY_OPENABLE)
-                        type = "*/*" // 游戏需要的 json/json5 等
+                        // 主类型放宽为通配符，使选择器能显示更多文件
+                        type = "*/*"
+                        // 显式补充类型：各系统对 .json5 的识别结果不一致
                         val mimeTypes = arrayOf(
                             "application/json",
-                            "application/octet-stream", // 很多系统把 json5 识别为 bin
-                            "text/plain"               // 有些系统把 json5 识别为纯文本
+                            "application/octet-stream", // 部分系统识别为二进制
+                            "text/plain"                // 部分系统识别为纯文本
                         )
                         putExtra(Intent.EXTRA_MIME_TYPES, mimeTypes)
                     }
@@ -200,71 +259,63 @@ class GameActivity : AppCompatActivity() {
                     return fileCallback
                 }
             }
-            // 异步监听返回状态
             navigationDelegate = object : GeckoSession.NavigationDelegate {
                 override fun onCanGoBack(session: GeckoSession, canGoBack: Boolean) {
                     canGoBackState = canGoBack
-                }// 关键：允许并处理页面跳转
-                // 场景 1：在当前窗口直接点击跳转
+                }
+
+                /** 本地服务器资源留在 GeckoView 内，外部链接交给系统浏览器 */
                 override fun onLoadRequest(session: GeckoSession, request: GeckoSession.NavigationDelegate.LoadRequest): GeckoResult<AllowOrDeny> {
                     val url = request.uri
 
-                    // 1. 如果是 Data URI (游戏导出存档)
-                    // if (url.startsWith("data:")) {
-                        // 交给你的导出逻辑
-                        // exportDataUri(url)
-                        // 拒绝加载这个 URL，因为我们已经手动处理了文件下载
-                        // return GeckoResult.fromValue(AllowOrDeny.DENY)
-                    // }
+                    // data: URI 不在此处拦截：导出由 contentDelegate.onExternalResponse 处理
 
-                    // 2. 如果是本地服务器资源 (游戏运行所需)
                     if (url.startsWith("http://127.0.0.1") || url.startsWith("http://localhost")) {
                         return GeckoResult.fromValue(AllowOrDeny.ALLOW)
                     }
 
-                    // 3. 如果是外部链接 (http/https)，调用系统浏览器
                     if (url.startsWith("http://") || url.startsWith("https://")) {
                         openInSystemBrowser(url)
                         return GeckoResult.fromValue(AllowOrDeny.DENY)
                     }
 
-                    // 默认允许
                     return GeckoResult.fromValue(AllowOrDeny.ALLOW)
                 }
 
-                // 场景 2：网页通过 window.open 或 target="_blank" 打开新窗口
+                /** window.open 或 target="_blank"：交给系统浏览器，不创建新 Session */
                 override fun onNewSession(session: GeckoSession, uri: String): GeckoResult<GeckoSession> {
-                    // 直接调用系统浏览器
                     openInSystemBrowser(uri)
-
-                    // 返回 null 并告知 GeckoView 我们已接管，不需要创建新 Session
+                    // 返回 null 表示已由原生接管
                     return GeckoResult.fromValue(null)
                 }
             }
 
-            // 处理 Data URI 下载/导出
             contentDelegate = object : GeckoSession.ContentDelegate {
+                /** data: URI 形式的下载（游戏导出存档）在此接管 */
                 override fun onExternalResponse(session: GeckoSession, response: WebResponse) {
                     if (response.uri.startsWith("data:")) {
                         exportDataUri(response.uri, response.headers["content-type"])
                     }
                 }
 
-                // 页面进入/退出全屏（bridgePatch.js 会把游戏的 Tauri 全屏请求
-                // 翻译成标准 Fullscreen API，从而触发此回调）
+                /**
+                 * 页面进入或退出全屏。bridgePatch.js 会把游戏的 Tauri 全屏请求翻译成
+                 * 标准 Fullscreen API，从而触发此回调。
+                 */
                 override fun onFullScreen(session: GeckoSession, fullScreen: Boolean) {
                     setWebviewFullscreen(fullScreen)
                 }
 
-                // 回传通道：bridgePatch.js 把网页世界的意图写入标题。
-                // 之所以不用 runtime.sendNativeMessage：实测其 Promise 静默 reject，
-                // 不触发 MessageDelegate；而 onTitleChange 稳定可达。
+                // 回传通道：bridgePatch.js 把页面世界的意图写入标题。
+                // 不使用 runtime.sendNativeMessage：实测其 Promise 静默 reject，不触发 MessageDelegate；
+                // 而 onTitleChange 稳定可达。
                 override fun onTitleChange(session: GeckoSession, title: String?) {
                     val payload = title?.removePrefix(GD_TITLE_PREFIX) ?: return
-                    if (payload == title) return // 并非我们的消息
+                    if (payload == title) return // 不是本移植的消息
                     when (payload.substringBefore(' ')) {
                         "fullscreen" -> setWebviewFullscreen(payload.substringAfter(' ').toBoolean())
                         "exportName" -> pendingExportName = payload.substringAfter(' ')
+                        "openDataFolder" -> openGpNextFolder()
                     }
                 }
             }
@@ -283,7 +334,7 @@ class GameActivity : AppCompatActivity() {
         if (parts.size < 2) return
         pendingExport = Uri.decode(parts.subList(1, parts.size).joinToString(",")).toByteArray()
 
-        // 交给系统保存对话框，由用户决定位置和文件名
+        // 交由系统保存对话框决定位置与文件名
         val fallbackType = contentType?.takeIf { it.isNotBlank() } ?: "application/octet-stream"
         val name = pendingExportName ?: suggestFileName(fallbackType)
         pendingExportName = null
@@ -358,6 +409,7 @@ class GameActivity : AppCompatActivity() {
         })
     }
 
+    /** 首次安装或版本号变化时，把 assets 中的游戏包解压到 filesDir */
     private fun checkAndExtractAssets(currentVersion: Int) {
         val progressBar = ProgressBar(this).apply { isIndeterminate = true; setPadding(50, 50, 50, 50) }
         val dialog = MaterialAlertDialogBuilder(this)
@@ -383,6 +435,7 @@ class GameActivity : AppCompatActivity() {
                         }
                     }
                 }
+                // 记录已解压版本，后续启动可直接跳过解压
                 prefs.edit().putInt("extracted_version", currentVersion).apply()
                 withContext(Dispatchers.Main) {
                     dialog.dismiss()
@@ -395,7 +448,9 @@ class GameActivity : AppCompatActivity() {
         }
     }
 
+    /** 沉浸式全屏：隐藏状态栏与导航栏、允许刘海区域，并保持屏幕常亮 */
     private fun setupFullScreen() {
+        // 兜底隐藏 ActionBar
         supportActionBar?.hide()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             window.attributes.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
@@ -453,7 +508,7 @@ class GameActivity : AppCompatActivity() {
         val originalUri = if (resultCode == RESULT_OK) data?.data else null
 
         if (originalUri != null) {
-            // 关键补丁：转换 content:// 到 file://
+            // GeckoView 只接受 file: URI，content: 需先复制到私有目录
             val fileUri = if ("file".equals(originalUri.scheme, ignoreCase = true)) {
                 originalUri
             } else {
@@ -461,7 +516,6 @@ class GameActivity : AppCompatActivity() {
             }
 
             if (fileUri != null) {
-                // 传回拷贝后的 File Uri
                 fileCallback?.complete(prompt.confirm(this, fileUri))
             } else {
                 fileCallback?.complete(prompt.dismiss())
@@ -470,15 +524,15 @@ class GameActivity : AppCompatActivity() {
             fileCallback?.complete(prompt.dismiss())
         }
 
-        // 释放引用
         fileCallback = null
         currentFilePrompt = null
     }
-    // 辅助函数：将 Content Uri 转换为私有目录下的 File Uri
+
+    /** 把 content: URI 的内容复制到私有目录，返回对应的 file: URI */
     private fun toFileUri(context: android.content.Context, uri: Uri): Uri? {
         try {
             val inputStream = context.contentResolver.openInputStream(uri) ?: return null
-            // 建立临时文件，建议保留原文件扩展名
+            // 临时文件落在 cacheDir，由系统按缓存回收
             val tempFile = File(context.cacheDir, "upload_temp_${System.currentTimeMillis()}")
             tempFile.outputStream().use { outputStream ->
                 inputStream.copyTo(outputStream)
@@ -490,13 +544,150 @@ class GameActivity : AppCompatActivity() {
             return null
         }
     }
-    // 辅助函数：调用系统浏览器
+    /** 调用系统浏览器打开外部链接 */
     private fun openInSystemBrowser(url: String) {
         try {
             val intent = Intent(Intent.ACTION_VIEW, url.toUri())
             startActivity(intent)
         } catch (e: Exception) {
             Log.e("GeckoView", "无法打开系统浏览器: ${e.message}")
+        }
+    }
+
+    // ── gp-next 数据目录 I/O ──
+    // 调用方是 bridgePatch.js 注入到页面世界的钩子：读取走 /gp-next 虚拟路径，
+    // 元数据与写操作走 /__gdnext/fs/* 端点。传入路径为相对 AppData 的路径，
+    // 例如 gp-next/packs/Foo/pack.json。
+
+    /** 从查询参数 path 取出 gp-next 相对路径 */
+    private fun ApplicationCall.gpNextQueryPath(): String =
+        request.queryParameters["path"].orEmpty()
+
+    /** 以 JSON 布尔值应答，供页面侧直接 res.json() 解析 */
+    private suspend fun ApplicationCall.respondBool(value: Boolean) =
+        respondText(value.toString(), ContentType.Application.Json)
+
+    /**
+     * 把 gp-next 相对路径解析为 filesDir 下的真实文件。
+     * 越界或非法输入一律收敛到数据根目录，避免逃逸到 filesDir 的其他位置。
+     */
+    private fun gpNextFile(rawPath: String): File {
+        val root = gpNextDir.canonicalFile
+        val rootPrefix = root.path + File.separator
+        // 页面侧应传相对路径；若误传带 origin 的绝对 URL，此处取其路径部分
+        val withoutScheme = rawPath.substringAfter("://", rawPath)
+        val relative = if (withoutScheme == rawPath) {
+            withoutScheme
+        } else {
+            withoutScheme.substringAfter('/', "")
+        }
+        val normalized = relative.replace('\\', '/').trimStart('/')
+        val candidate = File(filesDir, normalized).canonicalFile
+        return if (candidate.path == root.path || candidate.path.startsWith(rootPrefix)) candidate else root
+    }
+
+    /** 返回 [{name, isFile, isDirectory, isSymlink}] 形式的 JSON；目录不存在时返回空数组 */
+    private fun gpNextReadDirJson(rawPath: String): String {
+        val entries = JSONArray()
+        gpNextFile(rawPath).listFiles()?.forEach { file ->
+            entries.put(JSONObject().apply {
+                put("name", file.name)
+                put("isFile", file.isFile)
+                put("isDirectory", file.isDirectory)
+                // 内部存储不涉及符号链接，固定为 false；需要真实判断时见 gpNextStatJson
+                put("isSymlink", false)
+            })
+        }
+        return entries.toString()
+    }
+
+    private fun gpNextExists(rawPath: String): Boolean = gpNextFile(rawPath).exists()
+
+    /** mkdirs() 在目录已存在时返回 false，因此以 isDirectory 判断最终结果 */
+    private fun gpNextMkdir(rawPath: String): Boolean {
+        val dir = gpNextFile(rawPath)
+        dir.mkdirs()
+        return dir.isDirectory
+    }
+
+    private fun gpNextRemove(rawPath: String): Boolean {
+        val file = gpNextFile(rawPath)
+        // 仅用于清理 __gpn_edits，禁止删除数据根
+        if (file.canonicalFile == gpNextDir.canonicalFile) return false
+        return file.deleteRecursively()
+    }
+
+    /** 重命名；源文件不存在，或任一参数指向数据根时返回 false */
+    private fun gpNextRename(oldRawPath: String, newRawPath: String): Boolean {
+        val src = gpNextFile(oldRawPath)
+        if (!src.exists()) return false
+        val dst = gpNextFile(newRawPath)
+        if (src.canonicalFile == gpNextDir.canonicalFile || dst.canonicalFile == gpNextDir.canonicalFile) {
+            return false
+        }
+        dst.parentFile?.mkdirs()
+        return src.renameTo(dst)
+    }
+
+    /** 写入二进制内容，父目录不存在时自动创建 */
+    private fun gpNextWriteBytes(rawPath: String, bytes: ByteArray): Boolean = runCatching {
+        val file = gpNextFile(rawPath)
+        file.parentFile?.mkdirs()
+        file.writeBytes(bytes)
+    }.isSuccess
+
+    /**
+     * 生成 stat / lstat 的结果，字段与 @tauri-apps/plugin-fs 的 FileInfo 一致。
+     * dist-js 会逐字段读取，其中 mtime/atime 必须是毫秒时间戳或 null，且字段不可缺失。
+     * 使用 Os.lstat 而非 File，以便识别符号链接——新版包快照会拒绝含符号链接的包。
+     * 路径不存在时返回 null，由调用方转换为 404，与 Tauri 的 stat 失败语义一致。
+     */
+    private fun gpNextStatJson(rawPath: String): String? = runCatching {
+        val file = gpNextFile(rawPath)
+        val st = Os.lstat(file.absolutePath)
+        val type = st.st_mode and OsConstants.S_IFMT
+        JSONObject().apply {
+            put("isFile", type == OsConstants.S_IFREG)
+            put("isDirectory", type == OsConstants.S_IFDIR)
+            put("isSymlink", type == OsConstants.S_IFLNK)
+            put("size", st.st_size)
+            // Os.lstat 返回秒，而 FileInfo 使用毫秒
+            put("mtime", st.st_mtime * 1000L)
+            put("atime", st.st_atime * 1000L)
+            // Android 无法获取 birthtime，此处以 ctime 近似
+            put("birthtime", st.st_ctime * 1000L)
+            put("readonly", !file.canWrite())
+            put("fileAttributes", 0)
+            put("dev", st.st_dev)
+            put("ino", st.st_ino)
+            put("mode", st.st_mode)
+            put("nlink", st.st_nlink)
+            put("uid", st.st_uid)
+            put("gid", st.st_gid)
+            put("rdev", st.st_rdev)
+            put("blksize", st.st_blksize)
+            put("blocks", st.st_blocks)
+        }.toString()
+    }.getOrNull()
+
+    /**
+     * 以系统文件管理器打开 gp-next 数据目录（即 DocumentsProvider 的 gpnext 根）。
+     * 对应游戏 patcher 页的「打开补丁文件夹」。
+     */
+    private fun openGpNextFolder() {
+        val authority = "$packageName.documents"
+        val rootUri = DocumentsContract.buildRootUri(authority, GameDocumentsProvider.GP_NEXT_ROOT_ID)
+        val initialUri =
+            DocumentsContract.buildDocumentUri(authority, "${GameDocumentsProvider.GP_NEXT_ROOT_ID}:")
+        val intent = Intent(Intent.ACTION_VIEW)
+            .addCategory(Intent.CATEGORY_DEFAULT)
+            .setDataAndType(rootUri, DocumentsContract.Root.MIME_TYPE_ITEM)
+            .putExtra(DocumentsContract.EXTRA_INITIAL_URI, initialUri)
+        try {
+            startActivity(intent)
+        } catch (e: Exception) {
+            Log.w(TAG, "无法打开 gp-next 数据目录", e)
+            Toast.makeText(this, R.string.documents_open_failed, Toast.LENGTH_SHORT).show()
         }
     }
 }

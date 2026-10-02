@@ -11,6 +11,17 @@ import org.mozilla.geckoview.GeckoView
 import kotlin.math.abs
 
 
+/**
+ * 把触摸手势转换为鼠标事件，供游戏使用。
+ *
+ * 事件注入：左键的按下/移动/抬起与滚轮都使用 native MotionEvent（SOURCE_MOUSE）；
+ * 右键不在此类处理，由页面侧的 touchPatch.js 派发 JS MouseEvent。
+ *
+ * 手势映射：
+ * - 单指拖动：左键按下 → 移动 → 抬起；
+ * - 双指滑动：以两指中点作为光标位置，纵向位移映射为滚轮；
+ * - 双指轻点（位移未超过 moveThreshold）：由 touchPatch.js 处理为右键。
+ */
 class MouseGameWebView @JvmOverloads constructor(
     context: Context, attrs: AttributeSet? = null
 ) : GeckoView(context, attrs) {
@@ -32,6 +43,7 @@ class MouseGameWebView @JvmOverloads constructor(
     }
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        // 真实鼠标事件不做转换，直接交给 GeckoView
         if (event.source == InputDevice.SOURCE_MOUSE) {
             return super.dispatchTouchEvent(event)
         }
@@ -55,7 +67,8 @@ class MouseGameWebView @JvmOverloads constructor(
 
             MotionEvent.ACTION_POINTER_DOWN -> {
                 if (pointerCount == 2) {
-                    isDragging = false // 取消左键拖拽
+                    // 进入双指手势，取消左键拖拽
+                    isDragging = false
                     hasMovedEnough = false
                     val cx = (event.getX(0) + event.getX(1)) / 2
                     val cy = (event.getY(0) + event.getY(1)) / 2
@@ -63,8 +76,8 @@ class MouseGameWebView @JvmOverloads constructor(
                     touchStartCenterY = cy
                     lastScrollY = cy
 
-                    // 【关键补全】双指按下瞬间的 move
-                    // 对应 JS: emitMouseEvent("mousemove", touchStartCenter, 0);
+                    // 双指按下瞬间，先在两指中点补发一次移动（与 touchPatch.js 的 mousemove 对应），
+                    // 使后续滚轮以按下点为基准
                     injectMouseEventAt(cx, cy, MotionEvent.ACTION_MOVE, 0)
                 }
             }
@@ -87,7 +100,7 @@ class MouseGameWebView @JvmOverloads constructor(
             }
 
             MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
-                // 当最后一根手指离开
+                // 仅最后一根手指离开时收尾
                 if (action == MotionEvent.ACTION_UP) {
                     isTouching = false
                     mainHandler.removeCallbacksAndMessages(null)
@@ -96,10 +109,9 @@ class MouseGameWebView @JvmOverloads constructor(
                         injectMouseEventAt(event.x, event.y, MotionEvent.ACTION_UP, MotionEvent.BUTTON_PRIMARY)
                     }
                     else if (maxTouches == 2 && !hasMovedEnough) {
-                        // 【关键补全】右键点击逻辑，包含它之前的 move
-                        // 对应 JS: emitMouseEvent("mousemove", finalCenter, 0);
-                        // 然后再 Down/Up 右键
-                        // injectRightClickAt(touchStartCenterX, touchStartCenterY)
+                        // 双指轻点应产生右键，但此处刻意不处理：右键由 touchPatch.js 在页面侧派发
+                        // （它监听 touchend 后向 GameCanvas 发出 mousemove + 右键 down/up）。
+                        // 若在此重复注入会产生两次右键，故 injectRightClickAt 未被调用。
                     }
 
                     // 重置状态
@@ -139,16 +151,17 @@ class MouseGameWebView @JvmOverloads constructor(
     }
 
 
+    /**
+     * 右键注入的备选实现，当前未启用：右键由 touchPatch.js 在页面侧派发。
+     * 保留此方法以便需要改回原生路径时直接启用。
+     */
     private fun injectRightClickAt(x: Float, y: Float) {
-//        val upEvent = MotionEvent.obtain(
-//            SystemClock.uptimeMillis(),
-//            SystemClock.uptimeMillis(),
-//            MotionEvent.ACTION_MOVE,
-//            x,
-//            y,
-//            0
-//        )
-//        super.dispatchTouchEvent(upEvent)
-//        upEvent.recycle()
+        // 备选：先以一个 ACTION_MOVE 把光标移到目标位置
+        // val move = MotionEvent.obtain(
+        //     SystemClock.uptimeMillis(), SystemClock.uptimeMillis(),
+        //     MotionEvent.ACTION_MOVE, x, y, 0
+        // )
+        // super.dispatchTouchEvent(move)
+        // move.recycle()
     }
 }
